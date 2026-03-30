@@ -7,43 +7,29 @@ from pathlib import Path
 def rms_norm(
     tensor: torch.Tensor, weight: torch.Tensor, norm_eps: float
 ) -> torch.Tensor:
-    return (
-        tensor
-        * torch.rsqrt(tensor.pow(2).mean(dim=-1, keepdim=True) + norm_eps)
-        * weight
-    )
+    pass
 
 
-def rope_rotate(embeddings: torch.Tensor, rope_theta: torch.Tensor) -> torch.Tensor:
-    # Split into pairs
-    embeddings_split = embeddings.float().view(embeddings.shape[0], -1, 2)
+def rope_rotate(embeddings: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
+    # Split into pairs for RoPE
+    embedding_split = embeddings.float().view(embeddings.shape[0], -1, 2)
 
     # Convert to complex numbers
-    embeddings_complex = torch.view_as_complex(embeddings_split)
+    embedding_complex = torch.view_as_complex(embedding_split)
 
-    # Create frequencies for each position
-    freqs = 1.0 / (
-        rope_theta
-        ** (
-            torch.arange(embeddings.shape[0], device=embeddings.device)
-            / embeddings.shape[0]
-        )
+    # Apply RoPE rotation
+    embedding_rotated_complex = embedding_complex * freqs_cis
+
+    # Convert back to real
+    embedding_rotated = torch.view_as_real(embedding_rotated_complex).view(
+        embedding_split.shape
     )
-    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
 
-    # Apply rotation
-    rotated_complex = embeddings_complex * freqs_cis.unsqueeze(1)
-
-    # Convert back to real numbers
-    rotated_real = torch.view_as_real(rotated_complex)
-
-    # Reshape back to original shape
-    return rotated_real.view(embeddings.shape)
+    return embedding_rotated
 
 
 def init_tokenizer(tokenizer_path: str) -> tiktoken.Encoding:
     # Initialize tokenizer with the pretrained model
-    tokenizer_path = "model/tokenizer.model"
     special_tokens = [
         "<|begin_of_text|>",
         "<|end_of_text|>",

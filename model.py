@@ -5,29 +5,7 @@ import utils
 
 
 class LlamaModel:
-    """
-    Implementation of the Llama language model architecture.
-    This class loads a pre-trained Llama model and provides methods for token embedding generation,
-    attention mechanisms, and text generation.
-    """
-
     def __init__(self, model_dir: str | None = None, bos_token: int = 128000):
-        """
-        Initialize the Llama model.
-
-        Args:
-            model_dir (str | None): Directory containing model weights and parameters.
-            bos_token (int): The beginning-of-sequence token ID.
-
-        Process:
-            1. Sets model directory and BOS token
-            2. Loads model weights from consolidated file
-            3. Loads model configuration parameters from params.json
-            4. Sets up RoPE and head dimensions
-
-        Raises:
-            ValueError: If model_path is not set
-        """
         self.model_dir = model_dir
         self.model = None
         self.bos_token = bos_token
@@ -60,28 +38,15 @@ class LlamaModel:
         self.config["head_dim"] = 128
 
     def get_token_embeddings(self, prompt_tokens: list[int]) -> torch.Tensor:
-        """
-        Convert token IDs to their corresponding embeddings.
-
-        Args:
-            prompt_tokens (list[int]): List of token IDs to embed.
-
-        Process:
-            1. Creates an PyTorch embedding layer with model vocab size and dimension
-            2. Copies weights from the model's token embedding weights
-            3. Converts input tokens to tensor and applies embedding
-            4. Converts output to bfloat16 precision
-
-        Returns:
-            torch.Tensor: Token embeddings with shape [seq_len, embedding_dim]
-        """
         assert self.model is not None
         embedding_layer = torch.nn.Embedding(
             self.config["vocab_size"], self.config["dim"]
         )
         embedding_layer.weight.data.copy_(self.model["tok_embeddings.weight"])
-        # TODO: Create tensor from token_ids and apply embedding
-        pass
+        tokens = torch.tensor(prompt_tokens)
+        token_embeddings = embedding_layer(tokens).to(torch.bfloat16)
+        print(token_embeddings.shape)
+        return token_embeddings
 
     def scaled_dot_product_attn(
         self,
@@ -91,37 +56,26 @@ class LlamaModel:
         layer_embedding_norm: torch.Tensor,
         freqs_cis: torch.Tensor,
     ):
-        """
-        Compute scaled dot-product attention with rotary positional embeddings (RoPE).
-
-        Args:
-            q_layer_head (torch.Tensor): Query weight matrix for current attention head
-            k_layer_head (torch.Tensor): Key weight matrix for current attention head
-            v_layer_head (torch.Tensor): Value weight matrix for current attention head
-            layer_embedding_norm (torch.Tensor): Normalized input embeddings
-            freqs_cis (torch.Tensor): Complex rotation frequencies for RoPE
-
-        Process:
-            1. Project embeddings to get query, key, and value vectors
-            2. Split vectors into pairs for RoPE and convert to complex numbers
-            3. Apply RoPE rotation to queries and keys
-            4. Convert back to real numbers
-            5. Compute attention scores and scale by head dimension
-            6. Apply causal mask to prevent attending to future tokens
-            7. Apply softmax to get attention weights
-            8. Compute final attention output by weighted sum of values
-
-        Returns:
-            torch.Tensor: Attention output for the current head
-        """
         # Project embeddings to get query, key, and value vectors
-        q_per_token = None
-        k_per_token = None
-        v_per_token = None
+        q_per_token = torch.matmul(layer_embedding_norm, q_layer_head.T)
+        k_per_token = torch.matmul(layer_embedding_norm, k_layer_head.T)
+        v_per_token = torch.matmul(layer_embedding_norm, v_layer_head.T)
 
-        # Rotate via RoPE
-        q_rotated = utils.rope_rotate(q_per_token, freqs_cis)
-        k_rotated = utils.rope_rotate(k_per_token, freqs_cis)
+        # Split into pairs for RoPE
+        q_split = q_per_token.float().view(q_per_token.shape[0], -1, 2)
+        k_split = k_per_token.float().view(k_per_token.shape[0], -1, 2)
+
+        # Convert to complex numbers
+        q_complex = torch.view_as_complex(q_split)
+        k_complex = torch.view_as_complex(k_split)
+
+        # Apply RoPE rotation
+        q_rotated_complex = q_complex * freqs_cis
+        k_rotated_complex = k_complex * freqs_cis
+
+        # Convert back to real
+        q_rotated = torch.view_as_real(q_rotated_complex).view(q_per_token.shape)
+        k_rotated = torch.view_as_real(k_rotated_complex).view(k_per_token.shape)
 
         # Compute attention scores
         qk_per_token = torch.matmul(q_rotated, k_rotated.T) / (
@@ -129,11 +83,18 @@ class LlamaModel:
         )
 
         # Create and apply attention mask
-        mask = None
+        mask = torch.full(
+            (layer_embedding_norm.shape[0], layer_embedding_norm.shape[0]),
+            float("-inf"),
+            device=layer_embedding_norm.device,
+        )
+        mask = torch.triu(mask, diagonal=1)
         qk_per_token_after_masking = qk_per_token + mask
 
         # Apply softmax
-        qk_per_token_after_masking_after_softmax = None
+        qk_per_token_after_masking_after_softmax = torch.nn.functional.softmax(
+            qk_per_token_after_masking, dim=1
+        ).to(torch.bfloat16)
 
         # Compute final attention output
         qkv_attention = torch.matmul(
@@ -143,44 +104,31 @@ class LlamaModel:
         return qkv_attention
 
     def propagate_layer(self, layer_idx: int, embeddings: torch.Tensor):
-        """
-        Process embeddings through a single transformer layer.
-
-        Args:
-            layer_idx (int): Index of the layer to process
-            embeddings (torch.Tensor): Token embeddings to process
-
-        Process:
-            1. Normalize embeddings for attention using RMS normalization
-            2. Extract and reshape QKV weight matrices
-            3. Generate RoPE frequencies for position encoding
-            4. Process each attention head, applying scaled dot-product attention
-            5. Concatenate attention heads and project back to embedding dimension
-            6. Add residual connection
-            7. Normalize for feed-forward network
-            8. Apply feed-forward network with SwiGLU activation
-            9. Add final residual connection
-
-        Returns:
-            torch.Tensor: Processed embeddings after this layer
-        """
         assert self.model is not None
 
         n_heads = self.config["n_heads"]
         n_kv_heads = self.config["n_kv_heads"]
 
         # Normalize for attention
-        layer_embedding_norm = None
+        layer_embedding_norm = utils.rms_norm(
+            embeddings,
+            self.model[f"layers.{layer_idx}.attention_norm.weight"],
+            self.config["norm_eps"],
+        )
 
         # Get and reshape weight matrices
         q_layer = self.model[f"layers.{layer_idx}.attention.wq.weight"]
-        q_layer = q_layer.view("TODO: Figure out what shape to use")
+        q_layer = q_layer.view(n_heads, q_layer.shape[0] // n_heads, self.config["dim"])
 
         k_layer = self.model[f"layers.{layer_idx}.attention.wk.weight"]
-        k_layer = k_layer.view("TODO: Figure out what shape to use")
+        k_layer = k_layer.view(
+            n_kv_heads, k_layer.shape[0] // n_kv_heads, self.config["dim"]
+        )
 
         v_layer = self.model[f"layers.{layer_idx}.attention.wv.weight"]
-        v_layer = v_layer.view("TODO: Figure out what shape to use")
+        v_layer = v_layer.view(
+            n_kv_heads, v_layer.shape[0] // n_kv_heads, self.config["dim"]
+        )
 
         # Create frequencies for RoPE - calculate per pair position
         zero_to_one = torch.tensor(range(64)) / 64  # 64 pairs for 128-dim vector
@@ -198,9 +146,9 @@ class LlamaModel:
 
         # Process each attention head
         for head_idx in range(n_heads):
-            q_layer_head = None
-            k_layer_head = None
-            v_layer_head = None
+            q_layer_head = q_layer[head_idx]
+            k_layer_head = k_layer[head_idx // 4]  # Share KV heads across 4 Q heads
+            v_layer_head = v_layer[head_idx // 4]
 
             qkv_attention_store.append(
                 self.scaled_dot_product_attn(
@@ -213,14 +161,14 @@ class LlamaModel:
             )
 
         # Merge attention heads
-        stacked_qkv_attention = None
+        stacked_qkv_attention = torch.cat(qkv_attention_store, dim=-1)
 
         # Project back to embedding dimension
-        w_layer = None
-        embedding_delta = None
+        w_layer = self.model[f"layers.{layer_idx}.attention.wo.weight"]
+        embedding_delta = torch.matmul(stacked_qkv_attention, w_layer.T)
 
         # Add residual connection
-        embedding_after_edit = None
+        embedding_after_edit = embeddings + embedding_delta
 
         # Normalize for feed-forward
         embedding_after_edit_normalized = utils.rms_norm(
@@ -235,7 +183,13 @@ class LlamaModel:
         w3 = self.model[f"layers.{layer_idx}.feed_forward.w3.weight"]
 
         # SwiGLU activation
-        output_after_feedforward = None
+        output_after_feedforward = torch.matmul(
+            torch.nn.functional.silu(
+                torch.matmul(embedding_after_edit_normalized, w1.T)
+            )
+            * torch.matmul(embedding_after_edit_normalized, w3.T),
+            w2.T,
+        )
 
         # Final residual connection
         final_embedding = embedding_after_edit + output_after_feedforward
@@ -243,24 +197,6 @@ class LlamaModel:
         return final_embedding
 
     def generate(self, tokens: list[int]) -> torch.Tensor:
-        """
-        Process tokens through the entire model to get final embeddings.
-
-        Args:
-            tokens (list[int]): List of token IDs to process
-
-        Process:
-            1. Check if model is loaded
-            2. Get initial token embeddings
-            3. Process embeddings through each model layer sequentially
-            4. Apply final normalization
-
-        Returns:
-            torch.Tensor: Final processed embeddings after all layers
-
-        Raises:
-            ValueError: If model is not loaded
-        """
         if self.model is None:
             raise ValueError("Model not loaded")
 
